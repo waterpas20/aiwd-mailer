@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-import requests
+import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,8 +9,36 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, origins=["https://www.aiwd.co.kr", "https://aiwd.co.kr"])
 
-# ponytail: Render 무료 플랜이 SMTP 포트를 차단하므로 Brevo HTTP API로 발송
-RECIPIENT = "ksnam@aiwd.co.kr"
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_KEY = os.getenv("ADMIN_KEY")
+
+
+def db():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS inquiries (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                company TEXT DEFAULT '',
+                email TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+
+try:
+    init_db()
+except Exception:
+    pass  # DATABASE_URL 미설정 상태로 배포돼도 서버는 뜨게 함
+
+
+def is_admin():
+    return ADMIN_KEY and request.headers.get("X-Admin-Key") == ADMIN_KEY
 
 
 @app.route("/send-email", methods=["POST"])
@@ -33,27 +61,46 @@ def send_email():
     if not all([name, email, message]):
         return jsonify({"status": "error", "message": "필수 항목이 누락되었습니다."}), 400
 
-    api_key = os.getenv("BREVO_API_KEY")
-    sender = os.getenv("BREVO_SENDER")
-    if not api_key or not sender:
-        return jsonify({"status": "error", "message": "메일 설정이 완료되지 않았습니다."}), 500
-
     try:
-        resp = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": api_key, "Content-Type": "application/json"},
-            json={
-                "sender": {"name": "AIWORLD 문의폼", "email": sender},
-                "to": [{"email": RECIPIENT}],
-                "replyTo": {"email": email, "name": name},
-                "subject": f"[AIWORLD 문의] {name} ({company})",
-                "textContent": f"이름: {name}\n기업명: {company}\n이메일: {email}\n\n문의사항:\n{message}",
-            },
-            timeout=10,
-        )
-        if resp.status_code in (200, 201):
-            return jsonify({"status": "success"})
-        return jsonify({"status": "error", "message": f"메일 발송 실패 ({resp.status_code}): {resp.text[:200]}"}), 500
+        with db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO inquiries (name, company, email, message) VALUES (%s, %s, %s, %s)",
+                (name, company, email, message),
+            )
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/inquiries", methods=["GET"])
+def list_inquiries():
+    if not is_admin():
+        return jsonify({"status": "error", "message": "인증 실패"}), 401
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, company, email, message,
+                       to_char(created_at AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD HH24:MI:SS')
+                FROM inquiries ORDER BY id DESC
+            """)
+            rows = cur.fetchall()
+        return jsonify([
+            {"id": r[0], "name": r[1], "company": r[2], "email": r[3],
+             "message": r[4], "created_at": r[5]}
+            for r in rows
+        ])
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/inquiry/<int:inquiry_id>", methods=["DELETE"])
+def delete_inquiry(inquiry_id):
+    if not is_admin():
+        return jsonify({"status": "error", "message": "인증 실패"}), 401
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM inquiries WHERE id = %s", (inquiry_id,))
+        return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
