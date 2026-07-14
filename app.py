@@ -1,15 +1,16 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import os
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app, origins=["https://www.aiwd.co.kr", "https://aiwd.co.kr"])
+
+# ponytail: Render 무료 플랜이 SMTP 포트를 차단하므로 Brevo HTTP API로 발송
+RECIPIENT = "ksnam@aiwd.co.kr"
 
 
 @app.route("/send-email", methods=["POST"])
@@ -32,24 +33,27 @@ def send_email():
     if not all([name, email, message]):
         return jsonify({"status": "error", "message": "필수 항목이 누락되었습니다."}), 400
 
-    naver_email = os.getenv("NAVER_EMAIL")
-    naver_password = os.getenv("NAVER_PASSWORD")
-
-    msg = MIMEMultipart()
-    msg["From"] = naver_email
-    msg["To"] = "ksnam@aiwd.co.kr"
-    msg["Subject"] = f"[AIWORLD 문의] {name} ({company})"
-    msg.attach(MIMEText(
-        f"이름: {name}\n기업명: {company}\n이메일: {email}\n\n문의사항:\n{message}",
-        "plain",
-        "utf-8",
-    ))
+    api_key = os.getenv("BREVO_API_KEY")
+    sender = os.getenv("BREVO_SENDER")
+    if not api_key or not sender:
+        return jsonify({"status": "error", "message": "메일 설정이 완료되지 않았습니다."}), 500
 
     try:
-        with smtplib.SMTP_SSL("smtp.naver.com", 465) as server:
-            server.login(naver_email, naver_password)
-            server.send_message(msg)
-        return jsonify({"status": "success"})
+        resp = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={"api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "sender": {"name": "AIWORLD 문의폼", "email": sender},
+                "to": [{"email": RECIPIENT}],
+                "replyTo": {"email": email, "name": name},
+                "subject": f"[AIWORLD 문의] {name} ({company})",
+                "textContent": f"이름: {name}\n기업명: {company}\n이메일: {email}\n\n문의사항:\n{message}",
+            },
+            timeout=10,
+        )
+        if resp.status_code in (200, 201):
+            return jsonify({"status": "success"})
+        return jsonify({"status": "error", "message": f"메일 발송 실패 ({resp.status_code}): {resp.text[:200]}"}), 500
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
